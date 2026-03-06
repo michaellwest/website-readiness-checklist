@@ -8,6 +8,10 @@ Design decisions are recorded here with rationale. For operator-facing changes s
 
 _Planned: `Test-PreFlight.ps1`, `Invoke-DNSCutover.ps1`, `Invoke-Rollback.ps1`, cutover runbook._
 
+### Server inventory template
+
+**Change:** Added `examples/inventory-template.csv` with all supported server hashtable keys and two example rows (minimal and fully populated). Companion `examples/README.md` documents each column, provides a CSV-to-hashtable loader snippet, and covers lifecycle staging and multi-site usage.
+
 ---
 
 ## 2026-03-06 — Bug fixes, robustness, code quality

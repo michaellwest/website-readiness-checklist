@@ -1,0 +1,3 @@
+Name,ServerIP,ExpectedVIP,ExpectedVIPPort,ExpectedSAN,SiteName,AppPoolName,WinRMPort
+WEB01,,,,,,,,
+WEB02,10.1.2.10,10.1.2.100,443,www.contoso.com,ContosoWeb,ContosoAppPool,5985

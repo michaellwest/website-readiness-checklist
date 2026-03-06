@@ -30,7 +30,7 @@ Items inferred from development history and known gaps. Prefix legend:
 ## Documentation
 
 - [ ] **Cutover runbook** (`runbook/Cutover-Runbook.md`) — Step-by-step operator checklist covering pre-cutover validation, DNS change execution, post-cutover validation, rollback criteria, and sign-off.
-- [ ] **Server inventory template** (`inventory-template.csv` or `.ps1`) — Starter file showing all supported server hashtable keys with example values and comments.
+- [x] **Server inventory template** (`examples/inventory-template.csv`) — Starter CSV with all supported server hashtable keys, minimal and fully-populated examples, and a loader snippet in `examples/README.md`.
 - [ ] **CHECKS.md row counts** — The "total check count" table at the bottom of `CHECKS.md` uses estimates. Validate against actual script output for a fully-populated server entry.
 
 ---
