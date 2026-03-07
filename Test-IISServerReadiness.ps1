@@ -1420,6 +1420,13 @@ function Test-IISServerReadiness {
         $winrmChecks = Test-WinRMLayer -ServerName $name -Credential $Credential -SourceIP $sourceIP
         $winrmChecks | ForEach-Object { $allChecks.Add($_) }
 
+        if ($winRMPort -eq 5986) {
+            $allChecks.Add((New-Check -Layer 'WinRM' -Name 'WinRM HTTPS Transport' -Status 'Warn' `
+                -Detail 'WinRMPort is 5986 (HTTPS) but the script connects over HTTP transport' `
+                -Remedy 'WinRM HTTPS (-UseSSL) is not yet supported; connections use HTTP regardless of port setting. Use port 5985 or note that traffic is unencrypted' `
+                -SourceIP $sourceIP -DestinationIP $name))
+        }
+
         # Only attempt remote checks if Invoke-Command succeeded
         $canRemote     = ($winrmChecks | Where-Object { $_.Name -eq 'Invoke-Command Execution' -and $_.Status -eq 'Pass' }) -ne $null
         $iisThumbprint = $null

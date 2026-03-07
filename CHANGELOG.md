@@ -8,6 +8,12 @@ Design decisions are recorded here with rationale. For operator-facing changes s
 
 _Planned: `Test-PreFlight.ps1`, `Invoke-DNSCutover.ps1`, `Invoke-Rollback.ps1`, cutover runbook._
 
+### WinRM HTTPS transport warning
+
+**Change:** When `WinRMPort` is set to 5986 (the HTTPS WinRM port), a `Warn` check (`WinRM HTTPS Transport`) is emitted advising the operator that the script connects over HTTP transport regardless of the port setting.
+
+**Rationale:** Port 5986 implies the operator expects encrypted WinRM, but `Invoke-Command` is not wired with `-UseSSL`. The warning makes this gap visible rather than silently connecting over HTTP on the HTTPS port. Full `-UseSSL` support is deferred pending design decisions around certificate trust configuration.
+
 ### Certificate revocation check (`-CheckRevocation` switch)
 
 **Change:** New optional `-CheckRevocation` switch parameter. When specified, adds certificate revocation validation at three locations: workstation-side Direct path (`Cert Revocation (Direct)`), workstation-side VIP path (`Cert Revocation (VIP)`), and server-side (`Leaf Revocation`). Each location also emits `CRL Reachability` rows — one per CRL Distribution Point URL extracted from the certificate — testing TCP connectivity to the CDP host.

@@ -17,7 +17,7 @@ Items inferred from development history and known gaps. Prefix legend:
 
 ## Test-IISServerReadiness.ps1
 
-- [?] **WinRM HTTPS (`-UseSSL`) support** — `WinRMPort = 5986` is honoured for TNC but `Invoke-Command` currently uses HTTP transport regardless. Needs a `-UseSSL` switch wired through, or at minimum a `Warn` when port 5986 is specified but HTTPS transport is not used.
+- [~] **WinRM HTTPS (`-UseSSL`) support** — `WinRMPort = 5986` is honoured for TNC but `Invoke-Command` currently uses HTTP transport regardless. A `Warn` check is now emitted when port 5986 is specified. Full `-UseSSL` wiring is still pending.
 - [?] **Multiple SAN assertion** — Currently one `ExpectedSAN` per server hashtable entry. Some servers host multiple sites. Evaluate whether `ExpectedSAN` should accept an array, or whether the operator should supply multiple hashtable entries for the same server.
 - [x] **Certificate revocation check** — Implemented via `-CheckRevocation` switch. Adds `Leaf Revocation`, `Cert Revocation (Direct/VIP)`, and `CRL Reachability` checks using `Online` revocation mode with 10s timeout. Existing chain checks remain `NoCheck`.
 - [ ] **AppPool identity check** — No check currently validates the application pool identity account, whether it exists, or whether it has the necessary file system permissions. Common gap on freshly provisioned servers.

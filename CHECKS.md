@@ -37,6 +37,7 @@ For full background and rules see `README.md` section 4.
 |---|---|---|---|
 | `Test-WSMan` | Pass, Fail | Workstation | Failure causes all IIS and Certificate checks to be skipped. |
 | `Invoke-Command Execution` | Pass, Fail | Workstation | Validates execution permission beyond WSMan connectivity. |
+| `WinRM HTTPS Transport` | Warn | Workstation | Emitted when `WinRMPort` is 5986. Advisory — script does not use HTTPS transport. |
 
 ---
 
@@ -174,7 +175,7 @@ SSL offload is determined by the matched binding's `protocol` field (`http` vs `
 |---|---|---|---|
 | Network | 3 | 5 | +1 if non-standard Direct port, +1 if non-standard VIP port |
 | DNS | 0 | 3 | 0 if `ExpectedSAN` absent |
-| WinRM | 2 | 2 | |
+| WinRM | 2 | 3 | +1 when `WinRMPort` is 5986 |
 | IIS | 2 | 11 | Varies with WebAdministration availability and binding count |
 | Certificate | 1 | ~8+N | Varies with chain depth. +1 revocation +N CRL rows when `-CheckRevocation` active |
 | HTTPS | 6 | 13+2+2N | Varies with `ServerIP`/`ExpectedVIP` presence and offload state. +2 revocation +2N CRL rows when `-CheckRevocation` active |
