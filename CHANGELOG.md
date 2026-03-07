@@ -8,6 +8,32 @@ Design decisions are recorded here with rationale. For operator-facing changes s
 
 _Planned: `Test-PreFlight.ps1`, `Invoke-DNSCutover.ps1`, `Invoke-Rollback.ps1`, cutover runbook._
 
+### Certificate revocation check (`-CheckRevocation` switch)
+
+**Change:** New optional `-CheckRevocation` switch parameter. When specified, adds certificate revocation validation at three locations: workstation-side Direct path (`Cert Revocation (Direct)`), workstation-side VIP path (`Cert Revocation (VIP)`), and server-side (`Leaf Revocation`). Each location also emits `CRL Reachability` rows — one per CRL Distribution Point URL extracted from the certificate — testing TCP connectivity to the CDP host.
+
+**Design decisions:**
+- Revocation checks are **separate rows**, not modifications to existing chain checks. This isolates CRL/OCSP reachability failures from chain trust failures.
+- `RevocationMode = Online` (not `Offline`) to actively query CRL/OCSP endpoints in real time rather than relying on stale cached data.
+- `RevocationFlag = EntireChain` to check the leaf and all intermediates.
+- `UrlRetrievalTimeout = 10s` to match the TLS handshake timeout convention.
+- When the switch is not specified, no revocation or CRL rows are emitted — existing behaviour is unchanged.
+- CDP URLs are extracted from the CRL Distribution Points extension (OID `2.5.29.31`) using `Format($false)` and regex matching on `URL=` tokens.
+
+**Rationale:** A revoked certificate behind a load balancer would cause immediate outages post-cutover. Revocation checking is opt-in because it makes outbound HTTP/LDAP calls to CRL endpoints, which may timeout on air-gapped or firewalled servers. The two-part approach (revocation verdict + CRL reachability) tells the operator both *whether* a cert is revoked and *why* revocation checks might fail (firewall blocking the CDP).
+
+### AIA URL surfaced on chain validation failure
+
+**Change:** When `X509Chain.Build()` fails, both the workstation-side chain check (`Invoke-TLSCheck` — Cert Chain Direct/VIP) and the remote scriptblock chain check (`Leaf Chain Valid`) now extract the Authority Information Access (AIA) CA Issuers URL from the leaf certificate and append it to the `Detail` field. When an AIA URL is found, the remedy text directs the operator to download from that URL after verifying the thumbprint with their CA team. No outbound HTTP requests are made by the script.
+
+**Rationale:** When chain validation fails due to a missing intermediate, the operator previously had to identify the correct intermediate CA certificate independently. The AIA extension is embedded in most CA-signed certificates and points to the issuing CA's certificate distribution point. Surfacing this URL gives the operator an actionable starting point without the script making any outbound connections or modifying certificate stores — preserving the read-only validation principle. Auto-download was considered and rejected for security reasons (SSRF risk from attacker-controlled URLs, scope creep from read-only to state-modifying, enterprise policy conflicts with outbound fetches from untrusted input).
+
+### Suppress Test-NetConnection progress bar
+
+**Change:** `Test-NetworkLayer` sets `$ProgressPreference = 'SilentlyContinue'` (function-scoped) to suppress progress bars on the three TNC calls that return rich objects (port 443, WinRM port, TraceRoute). The two non-standard port TNC calls in `Test-TLSLayer` now use `-InformationLevel Quiet` since they only need a boolean result.
+
+**Rationale:** `Test-NetConnection` emits a progress bar for each call which clutters operator output. The rich-object calls need `.RemoteAddress` and `.TraceRoute`, so `-InformationLevel Quiet` (which returns only a boolean) cannot be used there — scoped `$ProgressPreference` suppresses the progress bar without losing the object. The non-standard port calls only check success/failure and can use the simpler `-InformationLevel Quiet` approach.
+
 ### Server inventory template
 
 **Change:** Added `examples/inventory-template.csv` with all supported server hashtable keys and two example rows (minimal and fully populated). Companion `examples/README.md` documents each column, provides a CSV-to-hashtable loader snippet, and covers lifecycle staging and multi-site usage.

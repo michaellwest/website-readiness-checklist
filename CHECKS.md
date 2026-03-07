@@ -102,9 +102,11 @@ SSL offload is determined by the matched binding's `protocol` field (`http` vs `
 | `Leaf SAN Match` | Pass, Warn, Fail | Emitted when `ExpectedSAN` provided. Exact match → Pass. Wildcard on public TLD → Warn. No match → Fail. |
 | `Leaf Cert Located` | Pass, Warn | Emitted when `ExpectedSAN` **not** provided. Fallback: selects cert with furthest expiry. |
 | `Leaf Expiry (threshold: {N} days)` | Pass, Warn | `N` = `CertExpiryThresholdDays` param (default 30). |
-| `Leaf Chain Valid` | Pass, Warn | Builds chain with `X509Chain` on server, revocation disabled. |
+| `Leaf Chain Valid` | Pass, Warn | Builds chain with `X509Chain` on server, revocation disabled. On failure, extracts AIA CA Issuers URL from the leaf certificate (if present) and appends it to Detail. |
 | `{CA label} Present in Root Store` | Pass, Warn | One row per CA in chain. |
 | `{CA label} Expiry` | Pass, Warn | One row per CA in chain, same threshold. |
+| `Leaf Revocation` | Pass, Warn, Fail | Only when `-CheckRevocation` specified. Builds chain with `Online` revocation and `EntireChain` flag. 10s timeout. |
+| `CRL Reachability` | Pass, Fail, Info | Only when `-CheckRevocation` specified. TCP connectivity test to each CRL Distribution Point URL host. One row per CDP URL. Info if no CDP extension. |
 
 ---
 
@@ -122,7 +124,9 @@ SSL offload is determined by the matched binding's `protocol` field (`http` vs `
 | `TLS Version (Direct)` | Pass, Fail, Skip | TLS 1.2/1.3 = Pass. TLS 1.0/1.1 = Fail. |
 | `Cert SAN (Direct)` | Pass, Warn, Fail, Skip | SAN match against `ExpectedSAN`. |
 | `Cert Expiry (Direct)` | Pass, Warn, Skip | `CertExpiryThresholdDays` threshold. |
-| `Cert Chain (Direct)` | Pass, Warn, Skip | Chain built from workstation trust store. |
+| `Cert Chain (Direct)` | Pass, Warn, Skip | Chain built from workstation trust store. On failure, extracts AIA CA Issuers URL (if present) and appends to Detail. |
+| `Cert Revocation (Direct)` | Pass, Warn, Fail | Only when `-CheckRevocation` specified. Builds chain with `Online` revocation and `EntireChain` flag. 10s timeout. |
+| `CRL Reachability (Direct)` | Pass, Fail, Info | Only when `-CheckRevocation` specified. TCP connectivity test to each CRL Distribution Point URL host. One row per CDP URL. Info if no CDP extension. |
 
 ### VIP path
 
@@ -132,7 +136,9 @@ SSL offload is determined by the matched binding's `protocol` field (`http` vs `
 | `TLS Version (VIP)` | Pass, Fail, Skip | Same TLS 1.2/1.3 rule. |
 | `Cert SAN (VIP)` | Pass, Warn, Fail, Skip | SAN match against `ExpectedSAN`. |
 | `Cert Expiry (VIP)` | Pass, Warn, Skip | |
-| `Cert Chain (VIP)` | Pass, Warn, Skip | |
+| `Cert Chain (VIP)` | Pass, Warn, Skip | Same AIA extraction as Direct. |
+| `Cert Revocation (VIP)` | Pass, Warn, Fail | Only when `-CheckRevocation` specified. Same revocation logic as Direct. |
+| `CRL Reachability (VIP)` | Pass, Fail, Info | Only when `-CheckRevocation` specified. TCP connectivity test per CDP URL. |
 
 ### Cross-path comparison
 
@@ -170,8 +176,8 @@ SSL offload is determined by the matched binding's `protocol` field (`http` vs `
 | DNS | 0 | 3 | 0 if `ExpectedSAN` absent |
 | WinRM | 2 | 2 | |
 | IIS | 2 | 11 | Varies with WebAdministration availability and binding count |
-| Certificate | 1 | ~8 | Varies with chain depth |
-| HTTPS | 6 | 13 | Varies with `ServerIP`/`ExpectedVIP` presence and offload state |
+| Certificate | 1 | ~8+N | Varies with chain depth. +1 revocation +N CRL rows when `-CheckRevocation` active |
+| HTTPS | 6 | 13+2+2N | Varies with `ServerIP`/`ExpectedVIP` presence and offload state. +2 revocation +2N CRL rows when `-CheckRevocation` active |
 | HTTP | 0 | 1 | Only when offload active |
 
 Typical full run (all inputs provided, no offload, 2-CA chain): **~38 rows per server**.

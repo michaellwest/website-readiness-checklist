@@ -128,6 +128,7 @@ Empty CSV cells become absent hashtable keys, triggering the script's `Skip` log
 | `-Servers` | `hashtable[]` | *(required)* | Array of server hashtables. See [Server Inventory](#server-inventory). |
 | `-Credential` | `PSCredential` | Kerberos | Explicit credentials for WinRM and `Invoke-Command`. |
 | `-CertExpiryThresholdDays` | `int` | `30` | Days before certificate expiry that triggers a `Warn` status. |
+| `-CheckRevocation` | `switch` | Off | Enables certificate revocation checking via CRL/OCSP. Adds `Leaf Revocation`, `Cert Revocation (Direct/VIP)`, and `CRL Reachability` checks. Makes outbound HTTP/LDAP calls to CRL distribution point endpoints — may timeout on firewalled networks. |
 
 ---
 

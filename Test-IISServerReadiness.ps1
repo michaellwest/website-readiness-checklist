@@ -30,6 +30,11 @@
 .PARAMETER CertExpiryThresholdDays
     Number of days before certificate expiry that triggers a Warn. Default: 30.
 
+.PARAMETER CheckRevocation
+    When specified, enables certificate revocation checking via CRL/OCSP. Adds Leaf Revocation,
+    Cert Revocation (Direct/VIP), and CRL Reachability checks. Makes outbound HTTP/LDAP calls to
+    CRL distribution point endpoints. Off by default to avoid timeouts on firewalled networks.
+
 .EXAMPLE
     $servers = @(
         @{
@@ -71,7 +76,10 @@ param(
     [System.Management.Automation.PSCredential]$Credential,
 
     [Parameter()]
-    [int]$CertExpiryThresholdDays = 30
+    [int]$CertExpiryThresholdDays = 30,
+
+    [Parameter()]
+    [switch]$CheckRevocation
 )
 
 #region --- Helpers ---
@@ -165,6 +173,7 @@ function Test-NetworkLayer {
         [string]$SourceIP
     )
     $checks = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $ProgressPreference = 'SilentlyContinue'
 
     # ICMP — destination is the server name; no resolved IP available without a separate lookup
     try {
@@ -524,7 +533,8 @@ function Invoke-CertInspection {
         [System.Security.Cryptography.X509Certificates.X509Certificate2]$Certificate,
         [string]$Label,                # e.g. '(Direct)' or '(VIP)'
         [string]$ExpectedSAN,          # optional; if provided, asserts SAN match
-        [int]$CertExpiryThresholdDays
+        [int]$CertExpiryThresholdDays,
+        [bool]$CheckRevocation = $false
     )
     $checks   = [System.Collections.Generic.List[PSCustomObject]]::new()
     $now      = [datetime]::UtcNow
@@ -582,14 +592,100 @@ function Invoke-CertInspection {
             $issues = ($chain.ChainStatus |
                         ForEach-Object { $_.StatusInformation.Trim() } |
                         Where-Object { $_ }) -join '; '
-            "Chain issues: $issues | Thumbprint: $($Certificate.Thumbprint)"
+            $aiaUrl = $null
+            $aiaExt = $Certificate.Extensions | Where-Object { $_.Oid.Value -eq '1.3.6.1.5.5.7.1.1' }
+            if ($aiaExt) {
+                $aiaText = $aiaExt.Format($false)
+                $aiaUrl = if ($aiaText -match 'CA Issuers[^U]*URI:(\S+)') { $Matches[1] } else { $null }
+            }
+            $aiaFragment = if ($aiaUrl) { " | AIA: $aiaUrl" } else { '' }
+            "Chain issues: $issues | Thumbprint: $($Certificate.Thumbprint)$aiaFragment"
         }
-        $chainRemedy = if (-not $valid) { 'Install missing intermediate or root CA certificates in LocalMachine\CA and LocalMachine\Root respectively on the server, then verify the chain using certutil -verify' } else { $null }
+        $chainRemedy = if (-not $valid) {
+            $aiaHint = if ($aiaUrl) { 'Download the intermediate CA certificate from the AIA URL shown in Detail, verify its thumbprint with your CA team, then install into LocalMachine\CA on the server' }
+                       else { 'Install missing intermediate or root CA certificates in LocalMachine\CA and LocalMachine\Root respectively on the server, then verify the chain using certutil -verify' }
+            $aiaHint
+        } else { $null }
         $checks.Add((New-Check -Layer 'HTTPS' -Name "Cert Chain $Label" -Status $chainStatus -Detail $chainDetail -Remedy $chainRemedy))
     } catch {
         $checks.Add((New-Check -Layer 'HTTPS' -Name "Cert Chain $Label" -Status 'Warn' `
             -Detail "Chain build failed: $($_.Exception.Message)" `
             -Remedy 'Unable to build certificate chain. Verify the certificate store is accessible and intermediate CA certs are installed'))
+    }
+
+    # Revocation (opt-in)
+    if ($CheckRevocation) {
+        # Part 1: X509Chain revocation verdict
+        try {
+            $revChain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+            $revChain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::Online
+            $revChain.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::EntireChain
+            $revChain.ChainPolicy.UrlRetrievalTimeout = [timespan]::FromSeconds(10)
+            $revValid = $revChain.Build($Certificate)
+            $revoked = $revChain.ChainStatus | Where-Object { $_.Status -band [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]::Revoked }
+            $offlineOrTimeout = $revChain.ChainStatus | Where-Object {
+                $_.Status -band ([System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]::RevocationStatusUnknown -bor
+                                 [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]::OfflineRevocation)
+            }
+            if ($revoked) {
+                $revStatus = 'Fail'
+                $revDetail = "Certificate is revoked | Thumbprint: $($Certificate.Thumbprint)"
+                $revRemedy = 'This certificate has been revoked by the issuing CA. Obtain a new certificate immediately and rebind it in IIS'
+            } elseif ($offlineOrTimeout) {
+                $revStatus = 'Warn'
+                $issues = ($offlineOrTimeout | ForEach-Object { $_.StatusInformation.Trim() } | Where-Object { $_ }) -join '; '
+                $revDetail = "Revocation check inconclusive — CRL/OCSP endpoint unreachable: $issues | Thumbprint: $($Certificate.Thumbprint)"
+                $revRemedy = 'CRL or OCSP endpoint is unreachable from this workstation. Verify outbound HTTP/LDAP access to the CRL distribution points listed in the certificate'
+            } elseif ($revValid) {
+                $revStatus = 'Pass'
+                $revDetail = "Revocation check passed | Thumbprint: $($Certificate.Thumbprint)"
+                $revRemedy = $null
+            } else {
+                $revStatus = 'Warn'
+                $issues = ($revChain.ChainStatus | ForEach-Object { $_.StatusInformation.Trim() } | Where-Object { $_ }) -join '; '
+                $revDetail = "Revocation check inconclusive — chain issues: $issues | Thumbprint: $($Certificate.Thumbprint)"
+                $revRemedy = 'Resolve chain trust issues first, then re-run with -CheckRevocation'
+            }
+            $checks.Add((New-Check -Layer 'HTTPS' -Name "Cert Revocation $Label" -Status $revStatus -Detail $revDetail -Remedy $revRemedy))
+        } catch {
+            $checks.Add((New-Check -Layer 'HTTPS' -Name "Cert Revocation $Label" -Status 'Warn' `
+                -Detail "Revocation check failed: $($_.Exception.Message) | Thumbprint: $($Certificate.Thumbprint)" `
+                -Remedy 'Unable to perform revocation check. Verify CRL/OCSP endpoint reachability and certificate store integrity'))
+        }
+
+        # Part 2: CRL Distribution Point reachability (TCP connectivity)
+        $cdpExt = $Certificate.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.31' }
+        if ($cdpExt) {
+            $cdpText = $cdpExt.Format($false)
+            $cdpUrls = [System.Collections.Generic.List[string]]::new()
+            # Format() returns text like "... URL=http://crl.example.com/ca.crl ..."
+            $cdpRegex = [regex]'URL=(\S+)'
+            foreach ($m in $cdpRegex.Matches($cdpText)) {
+                $cdpUrls.Add($m.Groups[1].Value)
+            }
+            foreach ($cdpUrl in $cdpUrls) {
+                try {
+                    $uri = [System.Uri]::new($cdpUrl)
+                    $cdpHost = $uri.Host
+                    $cdpPort = if ($uri.Port -gt 0 -and $uri.Port -ne -1) { $uri.Port }
+                               elseif ($uri.Scheme -eq 'https') { 443 }
+                               else { 80 }
+                    $tnc = Test-NetConnection -ComputerName $cdpHost -Port $cdpPort -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop
+                    $tncStatus = if ($tnc) { 'Pass' } else { 'Fail' }
+                    $tncDetail = if ($tnc) { "CRL endpoint reachable: $cdpUrl | Host: $cdpHost Port: $cdpPort" }
+                                 else { "CRL endpoint unreachable: $cdpUrl | Host: $cdpHost Port: $cdpPort" }
+                    $tncRemedy = if (-not $tnc) { "Open firewall access from this workstation to $cdpHost on port $cdpPort to allow CRL downloads for certificate revocation checking" } else { $null }
+                    $checks.Add((New-Check -Layer 'HTTPS' -Name "CRL Reachability $Label" -Status $tncStatus -Detail $tncDetail -Remedy $tncRemedy))
+                } catch {
+                    $checks.Add((New-Check -Layer 'HTTPS' -Name "CRL Reachability $Label" -Status 'Fail' `
+                        -Detail "CRL endpoint test failed for $cdpUrl — $($_.Exception.Message)" `
+                        -Remedy 'Verify the CRL distribution point URL is valid and accessible'))
+                }
+            }
+        } else {
+            $checks.Add((New-Check -Layer 'HTTPS' -Name "CRL Reachability $Label" -Status 'Info' `
+                -Detail "No CRL Distribution Point URLs found in certificate | Thumbprint: $($Certificate.Thumbprint)"))
+        }
     }
 
     return $checks
@@ -607,7 +703,8 @@ function Test-TLSLayer {
         [string]$SourceIP,
         [int]$ResolvedPort = 443,       # Port from IIS binding inspection
         [string]$ResolvedProtocol = 'https',  # Protocol from IIS binding
-        [int]$ExpectedVIPPort = 443     # NetScaler VIP port
+        [int]$ExpectedVIPPort = 443,    # NetScaler VIP port
+        [bool]$CheckRevocation = $false
     )
     $checks      = [System.Collections.Generic.List[PSCustomObject]]::new()
     $sniHostname = if (-not [string]::IsNullOrWhiteSpace($ExpectedSAN)) { $ExpectedSAN } else { $ServerName }
@@ -617,10 +714,10 @@ function Test-TLSLayer {
     # Non-standard port TNC checks — emitted when the resolved port differs from 443/80
     if (-not [string]::IsNullOrWhiteSpace($ServerIP) -and $ResolvedPort -ne 443 -and $ResolvedPort -ne 80) {
         try {
-            $tnc = Test-NetConnection -ComputerName $ServerIP -Port $ResolvedPort -WarningAction SilentlyContinue -ErrorAction Stop
-            $tncStatus = if ($tnc.TcpTestSucceeded) { 'Pass' } else { 'Fail' }
-            $tncDetail = if ($tnc.TcpTestSucceeded) { "Port $ResolvedPort open on $ServerIP" } else { "Port $ResolvedPort closed on $ServerIP" }
-            $tncRemedy = if (-not $tnc.TcpTestSucceeded) { "Verify port $ResolvedPort is open on the server firewall and any intermediate network firewalls" } else { $null }
+            $tnc = Test-NetConnection -ComputerName $ServerIP -Port $ResolvedPort -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop
+            $tncStatus = if ($tnc) { 'Pass' } else { 'Fail' }
+            $tncDetail = if ($tnc) { "Port $ResolvedPort open on $ServerIP" } else { "Port $ResolvedPort closed on $ServerIP" }
+            $tncRemedy = if (-not $tnc) { "Verify port $ResolvedPort is open on the server firewall and any intermediate network firewalls" } else { $null }
             $checks.Add((New-Check -Layer 'Network' -Name "TNC Port $ResolvedPort (Direct)" -Status $tncStatus -Detail $tncDetail -Remedy $tncRemedy `
                 -SourceIP $SourceIP -DestinationIP $ServerIP))
         } catch {
@@ -630,10 +727,10 @@ function Test-TLSLayer {
     }
     if (-not [string]::IsNullOrWhiteSpace($ExpectedVIP) -and $ExpectedVIPPort -ne 443) {
         try {
-            $tnc = Test-NetConnection -ComputerName $ExpectedVIP -Port $ExpectedVIPPort -WarningAction SilentlyContinue -ErrorAction Stop
-            $tncStatus = if ($tnc.TcpTestSucceeded) { 'Pass' } else { 'Fail' }
-            $tncDetail = if ($tnc.TcpTestSucceeded) { "Port $ExpectedVIPPort open on $ExpectedVIP" } else { "Port $ExpectedVIPPort closed on $ExpectedVIP" }
-            $tncRemedy = if (-not $tnc.TcpTestSucceeded) { "Verify port $ExpectedVIPPort is open on the NetScaler VIP and any intermediate network firewalls" } else { $null }
+            $tnc = Test-NetConnection -ComputerName $ExpectedVIP -Port $ExpectedVIPPort -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop
+            $tncStatus = if ($tnc) { 'Pass' } else { 'Fail' }
+            $tncDetail = if ($tnc) { "Port $ExpectedVIPPort open on $ExpectedVIP" } else { "Port $ExpectedVIPPort closed on $ExpectedVIP" }
+            $tncRemedy = if (-not $tnc) { "Verify port $ExpectedVIPPort is open on the NetScaler VIP and any intermediate network firewalls" } else { $null }
             $checks.Add((New-Check -Layer 'Network' -Name "TNC Port $ExpectedVIPPort (VIP)" -Status $tncStatus -Detail $tncDetail -Remedy $tncRemedy `
                 -SourceIP $SourceIP -DestinationIP $ExpectedVIP))
         } catch {
@@ -679,7 +776,8 @@ function Test-TLSLayer {
 
             if ($null -ne $directCert) {
                 Invoke-CertInspection -Certificate $directCert -Label '(Direct)' `
-                    -ExpectedSAN $ExpectedSAN -CertExpiryThresholdDays $CertExpiryThresholdDays |
+                    -ExpectedSAN $ExpectedSAN -CertExpiryThresholdDays $CertExpiryThresholdDays `
+                    -CheckRevocation $CheckRevocation |
                     ForEach-Object { $checks.Add($_) }
             } else {
                 $checks.Add((New-Check -Layer 'HTTPS' -Name 'Cert SAN (Direct)'    -Status 'Skip' -Detail 'No certificate returned from TLS handshake' -Remedy 'TLS handshake likely failed — resolve the TLS Handshake (Direct) failure first' -SourceIP $SourceIP -DestinationIP $ServerIP))
@@ -704,7 +802,8 @@ function Test-TLSLayer {
 
         if ($null -ne $vipCert) {
             Invoke-CertInspection -Certificate $vipCert -Label '(VIP)' `
-                -ExpectedSAN $ExpectedSAN -CertExpiryThresholdDays $CertExpiryThresholdDays |
+                -ExpectedSAN $ExpectedSAN -CertExpiryThresholdDays $CertExpiryThresholdDays `
+                -CheckRevocation $CheckRevocation |
                 ForEach-Object { $checks.Add($_) }
         } else {
             $checks.Add((New-Check -Layer 'HTTPS' -Name 'Cert SAN (VIP)'    -Status 'Skip' -Detail 'No certificate returned from TLS handshake' -Remedy 'TLS handshake likely failed — resolve the TLS Handshake (VIP) failure first' -SourceIP $SourceIP -DestinationIP $ExpectedVIP))
@@ -754,7 +853,8 @@ $RemoteScriptBlock = {
         [string]$SiteNameOverride,   # Optional — caller-supplied override; skips auto-detection when provided
         [string]$AppPoolOverride,    # Optional — caller-supplied override
         [string]$ExpectedSAN,
-        [int]$CertExpiryThresholdDays
+        [int]$CertExpiryThresholdDays,
+        [bool]$CheckRevocation
     )
 
     $results        = [System.Collections.Generic.List[hashtable]]::new()
@@ -1126,9 +1226,19 @@ $RemoteScriptBlock = {
                     'Chain valid'
                 } else {
                     $chainIssues = ($chain.ChainStatus | ForEach-Object { $_.StatusInformation.Trim() } | Where-Object { $_ }) -join '; '
-                    "Chain issues: $chainIssues"
+                    $aiaUrl = $null
+                    $aiaExt = $matchedCert.Extensions | Where-Object { $_.Oid.Value -eq '1.3.6.1.5.5.7.1.1' }
+                    if ($aiaExt) {
+                        $aiaText = $aiaExt.Format($false)
+                        $aiaUrl = if ($aiaText -match 'CA Issuers[^U]*URI:(\S+)') { $Matches[1] } else { $null }
+                    }
+                    $aiaFragment = if ($aiaUrl) { " | AIA: $aiaUrl" } else { '' }
+                    "Chain issues: $chainIssues$aiaFragment"
                 }
-                $chainRemedy = if (-not $valid) { 'Install missing intermediate or root CA certificates into LocalMachine\CA and LocalMachine\Root respectively, then verify with: certutil -verify -urlfetch <certfile>' } else { $null }
+                $chainRemedy = if (-not $valid) {
+                    if ($aiaUrl) { 'Download the intermediate CA certificate from the AIA URL shown in Detail, verify its thumbprint with your CA team, then install into LocalMachine\CA on this server' }
+                    else { 'Install missing intermediate or root CA certificates into LocalMachine\CA and LocalMachine\Root respectively, then verify with: certutil -verify -urlfetch <certfile>' }
+                } else { $null }
                 rCheck 'Certificate' 'Leaf Chain Valid' $chainStatus $chainDetail $chainRemedy
 
                 # --- CA certs: verify each chain element (skip index 0 — that is the leaf) exists in LocalMachine\Root ---
@@ -1165,6 +1275,66 @@ $RemoteScriptBlock = {
             } catch {
                 rCheck 'Certificate' 'Leaf Chain Valid' 'Warn' "Chain build failed: $($_.Exception.Message)" 'Unable to build certificate chain on the server. Verify intermediate CA certificates are installed and the certificate store is not corrupted'
             }
+
+            # Revocation (opt-in)
+            if ($CheckRevocation) {
+                # Part 1: X509Chain revocation verdict
+                try {
+                    $revChain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+                    $revChain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::Online
+                    $revChain.ChainPolicy.RevocationFlag = [System.Security.Cryptography.X509Certificates.X509RevocationFlag]::EntireChain
+                    $revChain.ChainPolicy.UrlRetrievalTimeout = [timespan]::FromSeconds(10)
+                    $revValid = $revChain.Build($matchedCert)
+                    $revoked = $revChain.ChainStatus | Where-Object { $_.Status -band [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]::Revoked }
+                    $offlineOrTimeout = $revChain.ChainStatus | Where-Object {
+                        $_.Status -band ([System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]::RevocationStatusUnknown -bor
+                                         [System.Security.Cryptography.X509Certificates.X509ChainStatusFlags]::OfflineRevocation)
+                    }
+                    if ($revoked) {
+                        rCheck 'Certificate' 'Leaf Revocation' 'Fail' "Certificate is revoked | Thumbprint: $($matchedCert.Thumbprint)" 'This certificate has been revoked by the issuing CA. Obtain a new certificate immediately and rebind it in IIS'
+                    } elseif ($offlineOrTimeout) {
+                        $issues = ($offlineOrTimeout | ForEach-Object { $_.StatusInformation.Trim() } | Where-Object { $_ }) -join '; '
+                        rCheck 'Certificate' 'Leaf Revocation' 'Warn' "Revocation check inconclusive — CRL/OCSP endpoint unreachable: $issues | Thumbprint: $($matchedCert.Thumbprint)" 'CRL or OCSP endpoint is unreachable from this server. Verify outbound HTTP/LDAP access to the CRL distribution points listed in the certificate'
+                    } elseif ($revValid) {
+                        rCheck 'Certificate' 'Leaf Revocation' 'Pass' "Revocation check passed | Thumbprint: $($matchedCert.Thumbprint)"
+                    } else {
+                        $issues = ($revChain.ChainStatus | ForEach-Object { $_.StatusInformation.Trim() } | Where-Object { $_ }) -join '; '
+                        rCheck 'Certificate' 'Leaf Revocation' 'Warn' "Revocation check inconclusive — chain issues: $issues | Thumbprint: $($matchedCert.Thumbprint)" 'Resolve chain trust issues first, then re-run with -CheckRevocation'
+                    }
+                } catch {
+                    rCheck 'Certificate' 'Leaf Revocation' 'Warn' "Revocation check failed: $($_.Exception.Message) | Thumbprint: $($matchedCert.Thumbprint)" 'Unable to perform revocation check. Verify CRL/OCSP endpoint reachability and certificate store integrity'
+                }
+
+                # Part 2: CRL Distribution Point reachability (TCP connectivity from server)
+                $cdpExt = $matchedCert.Extensions | Where-Object { $_.Oid.Value -eq '2.5.29.31' }
+                if ($cdpExt) {
+                    $cdpText = $cdpExt.Format($false)
+                    $cdpUrls = [System.Collections.Generic.List[string]]::new()
+                    $cdpRegex = [regex]'URL=(\S+)'
+                    foreach ($m in $cdpRegex.Matches($cdpText)) {
+                        $cdpUrls.Add($m.Groups[1].Value)
+                    }
+                    foreach ($cdpUrl in $cdpUrls) {
+                        try {
+                            $uri = [System.Uri]::new($cdpUrl)
+                            $cdpHost = $uri.Host
+                            $cdpPort = if ($uri.Port -gt 0 -and $uri.Port -ne -1) { $uri.Port }
+                                       elseif ($uri.Scheme -eq 'https') { 443 }
+                                       else { 80 }
+                            $tnc = Test-NetConnection -ComputerName $cdpHost -Port $cdpPort -InformationLevel Quiet -WarningAction SilentlyContinue -ErrorAction Stop
+                            $tncStatus = if ($tnc) { 'Pass' } else { 'Fail' }
+                            $tncDetail = if ($tnc) { "CRL endpoint reachable: $cdpUrl | Host: $cdpHost Port: $cdpPort" }
+                                         else { "CRL endpoint unreachable: $cdpUrl | Host: $cdpHost Port: $cdpPort" }
+                            $tncRemedy = if (-not $tnc) { "Open firewall access from this server to $cdpHost on port $cdpPort to allow CRL downloads for certificate revocation checking" } else { $null }
+                            rCheck 'Certificate' 'CRL Reachability' $tncStatus $tncDetail $tncRemedy
+                        } catch {
+                            rCheck 'Certificate' 'CRL Reachability' 'Fail' "CRL endpoint test failed for $cdpUrl — $($_.Exception.Message)" 'Verify the CRL distribution point URL is valid and accessible from this server'
+                        }
+                    }
+                } else {
+                    rCheck 'Certificate' 'CRL Reachability' 'Info' "No CRL Distribution Point URLs found in certificate | Thumbprint: $($matchedCert.Thumbprint)"
+                }
+            }
         }
     } catch {
         rCheck 'Certificate' 'Certificate Store Access' 'Fail' $_.Exception.Message 'Unable to open the certificate store. Verify the script is running with sufficient privileges (local administrator) on the target server'
@@ -1196,7 +1366,10 @@ function Test-IISServerReadiness {
         [System.Management.Automation.PSCredential]$Credential,
 
         [Parameter()]
-        [int]$CertExpiryThresholdDays = 30
+        [int]$CertExpiryThresholdDays = 30,
+
+        [Parameter()]
+        [switch]$CheckRevocation
     )
 
     foreach ($server in $Servers) {
@@ -1260,7 +1433,7 @@ function Test-IISServerReadiness {
                 $icmOpts = @{
                     ComputerName = $name
                     ScriptBlock  = $RemoteScriptBlock
-                    ArgumentList = $siteName, $poolName, $expectedSAN, $CertExpiryThresholdDays
+                    ArgumentList = $siteName, $poolName, $expectedSAN, $CertExpiryThresholdDays, $CheckRevocation.IsPresent
                     ErrorAction  = 'Stop'
                 }
                 if ($Credential) { $icmOpts.Credential = $Credential }
@@ -1314,10 +1487,11 @@ function Test-IISServerReadiness {
         Test-TLSLayer -ServerName $name -ServerIP $serverIP -ExpectedVIP $vip -ExpectedSAN $expectedSAN `
             -CertExpiryThresholdDays $CertExpiryThresholdDays -IISThumbprint $iisThumbprint `
             -SslOffload $sslOffload -SourceIP $sourceIP `
-            -ResolvedPort $resolvedPort -ResolvedProtocol $resolvedProto -ExpectedVIPPort $expectedVIPPort |
+            -ResolvedPort $resolvedPort -ResolvedProtocol $resolvedProto -ExpectedVIPPort $expectedVIPPort `
+            -CheckRevocation $CheckRevocation |
             ForEach-Object { $allChecks.Add($_) }
 
-        $checkedAt = [datetime]::UtcNow.ToString('o')
+        $checkedAt = [datetime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
 
         foreach ($check in $allChecks) {
             # Use the check's own SourceIP if set (remote checks carry the server's IP);
@@ -1347,7 +1521,8 @@ $splat = @{
     Servers                 = $Servers
     CertExpiryThresholdDays = $CertExpiryThresholdDays
 }
-if ($Credential) { $splat.Credential = $Credential }
+if ($Credential)      { $splat.Credential      = $Credential }
+if ($CheckRevocation) { $splat.CheckRevocation  = $CheckRevocation }
 
 Test-IISServerReadiness @splat
 
