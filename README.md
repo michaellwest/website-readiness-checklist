@@ -77,6 +77,13 @@ $results | Where-Object { $_.Status -in 'Fail','Warn' } | Format-Table -AutoSize
 $results | Export-Csv -Path results.csv -NoTypeInformation
 ```
 
+### With readiness summary
+
+```powershell
+# Summary prints to console; pipeline output is preserved for export
+.\Test-IISServerReadiness.ps1 -Servers $servers -Summary | Export-Csv results.csv -NoTypeInformation
+```
+
 ### With explicit credentials
 
 ```powershell
@@ -129,6 +136,7 @@ Empty CSV cells become absent hashtable keys, triggering the script's `Skip` log
 | `-Credential` | `PSCredential` | Kerberos | Explicit credentials for WinRM and `Invoke-Command`. |
 | `-CertExpiryThresholdDays` | `int` | `30` | Days before certificate expiry that triggers a `Warn` status. |
 | `-CheckRevocation` | `switch` | Off | Enables certificate revocation checking via CRL/OCSP. Adds `Leaf Revocation`, `Cert Revocation (Direct/VIP)`, and `CRL Reachability` checks. Makes outbound HTTP/LDAP calls to CRL distribution point endpoints — may timeout on firewalled networks. |
+| `-Summary` | `switch` | Off | Prints a human-readable readiness summary to the console after all checks complete. Uses `Write-Host` so pipeline output is not affected. |
 
 ---
 

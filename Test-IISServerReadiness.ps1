@@ -35,6 +35,11 @@
     Cert Revocation (Direct/VIP), and CRL Reachability checks. Makes outbound HTTP/LDAP calls to
     CRL distribution point endpoints. Off by default to avoid timeouts on firewalled networks.
 
+.PARAMETER Summary
+    When specified, prints a human-readable readiness summary to the console after all checks
+    complete. Uses Write-Host so pipeline output is not affected — results can still be piped
+    to Export-Csv or Format-Table.
+
 .EXAMPLE
     $servers = @(
         @{
@@ -65,6 +70,10 @@
     # With explicit credentials and custom expiry threshold
     $cred = Get-Credential
     Test-IISServerReadiness -Servers $servers -Credential $cred -CertExpiryThresholdDays 60
+
+.EXAMPLE
+    # With readiness summary — pipeline output is preserved
+    .\Test-IISServerReadiness.ps1 -Servers $servers -Summary | Export-Csv results.csv -NoTypeInformation
 #>
 
 [CmdletBinding()]
@@ -79,7 +88,10 @@ param(
     [int]$CertExpiryThresholdDays = 30,
 
     [Parameter()]
-    [switch]$CheckRevocation
+    [switch]$CheckRevocation,
+
+    [Parameter()]
+    [switch]$Summary
 )
 
 #region --- Helpers ---
@@ -160,6 +172,90 @@ function Invoke-HttpStatusCheck {
             -Remedy "Unexpected error during HTTP request. Verify IIS is running and the target is reachable" `
             -SourceIP $SourceIP -DestinationIP $ConnectTo
     }
+}
+
+function Write-ReadinessSummary {
+    param(
+        [PSCustomObject[]]$Results
+    )
+
+    if (-not $Results -or $Results.Count -eq 0) {
+        Write-Host "`nNo results to summarize." -ForegroundColor Yellow
+        return
+    }
+
+    $serverGroups = $Results | Group-Object ServerName
+
+    $readyCount      = 0
+    $notReadyCount   = 0
+    $incompleteCount = 0
+    $warningCount    = 0
+
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
+    Write-Host "  READINESS SUMMARY" -ForegroundColor Cyan
+    Write-Host "$('=' * 60)" -ForegroundColor Cyan
+
+    foreach ($sg in $serverGroups) {
+        $serverName = $sg.Name
+        $checks     = $sg.Group
+
+        $failCount = @($checks | Where-Object { $_.Status -eq 'Fail' }).Count
+        $warnCount = @($checks | Where-Object { $_.Status -eq 'Warn' }).Count
+        $skipCount = @($checks | Where-Object { $_.Status -eq 'Skip' }).Count
+
+        if ($failCount -gt 0) {
+            $verdict = 'Not Ready'
+            $color   = 'Red'
+            $notReadyCount++
+        } elseif ($skipCount -gt 0) {
+            $verdict = 'Incomplete'
+            $color   = 'Yellow'
+            $incompleteCount++
+        } elseif ($warnCount -gt 0) {
+            $verdict = 'Ready (warnings)'
+            $color   = 'Yellow'
+            $warningCount++
+        } else {
+            $verdict = 'Ready'
+            $color   = 'Green'
+            $readyCount++
+        }
+
+        Write-Host "`n  $serverName  " -NoNewline
+        Write-Host "[$verdict]" -ForegroundColor $color
+        Write-Host "    Pass: $(@($checks | Where-Object { $_.Status -eq 'Pass' }).Count)  Fail: $failCount  Warn: $warnCount  Skip: $skipCount  Info: $(@($checks | Where-Object { $_.Status -eq 'Info' }).Count)"
+    }
+
+    # Action items: Fail and Skip rows grouped by server
+    $actionItems = $Results | Where-Object { $_.Status -in 'Fail', 'Skip' }
+    if ($actionItems) {
+        Write-Host "`n$('-' * 60)" -ForegroundColor Cyan
+        Write-Host "  ACTION ITEMS" -ForegroundColor Cyan
+        Write-Host "$('-' * 60)" -ForegroundColor Cyan
+
+        $actionGroups = $actionItems | Group-Object ServerName
+        foreach ($ag in $actionGroups) {
+            Write-Host "`n  $($ag.Name)" -ForegroundColor White
+            foreach ($item in $ag.Group) {
+                $statusColor = if ($item.Status -eq 'Fail') { 'Red' } else { 'Yellow' }
+                $parts = $item.Detail -split ' \| Remedy: ', 2
+                $remedy = if ($parts.Count -gt 1) { $parts[1] } else { $parts[0] }
+                Write-Host "    [$($item.Status)] " -ForegroundColor $statusColor -NoNewline
+                Write-Host "$($item.Name): $remedy"
+            }
+        }
+    }
+
+    # Final one-liner
+    $total = $serverGroups.Count
+    Write-Host "`n$('=' * 60)" -ForegroundColor Cyan
+    Write-Host -NoNewline "  Ready: "
+    Write-Host -NoNewline "$($readyCount + $warningCount)/$total" -ForegroundColor Green
+    Write-Host -NoNewline "  |  Not Ready: "
+    Write-Host -NoNewline "$notReadyCount" -ForegroundColor Red
+    Write-Host -NoNewline "  |  Incomplete: "
+    Write-Host "$incompleteCount" -ForegroundColor Yellow
+    Write-Host "$('=' * 60)`n" -ForegroundColor Cyan
 }
 
 #endregion
@@ -1531,6 +1627,11 @@ $splat = @{
 if ($Credential)      { $splat.Credential      = $Credential }
 if ($CheckRevocation) { $splat.CheckRevocation  = $CheckRevocation }
 
-Test-IISServerReadiness @splat
+$results = Test-IISServerReadiness @splat
+$results
+
+if ($Summary) {
+    Write-ReadinessSummary -Results $results
+}
 
 #endregion

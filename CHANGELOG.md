@@ -8,6 +8,18 @@ Design decisions are recorded here with rationale. For operator-facing changes s
 
 _Planned: `Test-PreFlight.ps1`, `Invoke-DNSCutover.ps1`, `Invoke-Rollback.ps1`, cutover runbook._
 
+### Readiness summary (`-Summary` switch)
+
+**Change:** New optional `-Summary` switch parameter. When specified, prints a human-readable readiness summary to the console after all checks complete. The summary includes a per-server verdict table, grouped action items (Fail and Skip rows with extracted remedy text), and a one-line readiness count. Uses `Write-Host` exclusively — pipeline output is not affected, so results can still be piped to `Export-Csv` or `Format-Table`.
+
+**Verdicts:**
+- `Not Ready` — any Fail exists (red)
+- `Incomplete` — no Fail but Skip exists (yellow)
+- `Ready (warnings)` — no Fail/Skip but Warn exists (yellow)
+- `Ready` — all Pass/Info (green)
+
+**Rationale:** Operators previously had to manually filter for failures, extract remedies from the `Detail` field, and determine per-server readiness. The summary provides an at-a-glance verdict and actionable next steps without requiring pipeline manipulation, while preserving the existing flat-output contract for automation consumers.
+
 ### WinRM HTTPS transport warning
 
 **Change:** When `WinRMPort` is set to 5986 (the HTTPS WinRM port), a `Warn` check (`WinRM HTTPS Transport`) is emitted advising the operator that the script connects over HTTP transport regardless of the port setting.
