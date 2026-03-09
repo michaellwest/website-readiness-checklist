@@ -184,7 +184,7 @@ function Write-ReadinessSummary {
         return
     }
 
-    $serverGroups = $Results | Group-Object ServerName
+    $serverGroups = @($Results | Group-Object ServerName)
 
     $readyCount      = 0
     $notReadyCount   = 0
